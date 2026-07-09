@@ -1,15 +1,18 @@
-using OrdinaryDiffEqLowStorageRK
 using OrdinaryDiffEqLowStorageRK: DiscreteCallback
-
-using Printf
+using OrdinaryDiffEqLowStorageRK
 
 include(joinpath(@__DIR__, "TurbGen.jl"))
 using .TurbGen
 
 ###############################################################################
-# semidiscretization of the compressible Euler equations
+# semidiscretization of the compressible Navier-Stokes equations
+
+prandtl_number() = 0.72
+mu = 5.0e-4
 
 equations = CompressibleEulerEquations3D(1.4)
+equations_parabolic = CompressibleNavierStokesDiffusion3D(equations, mu = mu,
+                                                          Prandtl = prandtl_number())
 
 function initial_condition_uniform(x, t, equations::CompressibleEulerEquations3D)
     rho = 1.0
@@ -27,22 +30,20 @@ initial_condition = initial_condition_uniform
 turb_velocity = 0.5       # target Mach number
 turb_sol_weight = 1.0     # solenoidal weight (1.0 = purely solenoidal)
 cell = 5
-name_addition = ""
+name_addition = "ns_shockcapturing"
 num_cells = 2^cell
-polydeg = 4
+polydeg = 3
+domain_length = 1.0
+prefix = "../scratch/output/"
 
-domain_size = 1.0
-domain_size_label = "L$(domain_size)"
+run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_L$(domain_length)_ver$(name_addition)"
 
-prefix = "../../scratch/output/"
+analysis_outdir = joinpath(prefix, "Analysis_ns_shockcapturing_$(run_label)")
+solution_outdir = joinpath(prefix, "out_ns_shockcapturing_$(run_label)")
 
-run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_$(domain_size_label)_pd$(polydeg)_ver$(name_addition)"
-analysis_outdir = "Analysis_euler_shockcapturing_$(run_label)"
-solution_outdir = "out_euler_shockcapturing_$(run_label)"
-
-turb_gen = TurbGen.TurbGenGenerator()
+turb_gen = TurbGen.TurbGenGenerator(seed = 42)
 TurbGen.init_driving!(turb_gen,
-                      Dict{String, Any}("L" => [domain_size, domain_size, domain_size],
+                      Dict{String, Any}("L" => [domain_length, domain_length, domain_length],
                                         "velocity" => turb_velocity,
                                         "k_driv" => 1.5,
                                         "k_min" => 1.0,
@@ -68,7 +69,7 @@ function TurbulentForcing(generator)
     TurbulentForcing(generator, Array{SVector{3, Float64}, 4}(undef, 0, 0, 0, 0), -1)
 end
 
-# source term
+# source term (point-wise fallback)
 function (source::TurbulentForcing)(u, x, t, equations::CompressibleEulerEquations3D)
     rho, rho_v1, rho_v2, rho_v3, rho_e = u
     v1, v2, v3 = rho_v1 / rho, rho_v2 / rho, rho_v3 / rho
@@ -128,7 +129,6 @@ function Trixi.calc_sources!(du, u, t, source_terms::TurbulentForcing,
 end
 source_terms = TurbulentForcing(turb_gen)
 
-###############################################################################
 ###############################################################################
 # custom analysis integrals for turbulence diagnostics
 
@@ -232,15 +232,17 @@ solver = DGSEM(basis, surface_flux, volume_integral)
 # mesh
 
 coordinates_min = (0.0, 0.0, 0.0)
-coordinates_max = (1.0, 1.0, 1.0)
+coordinates_max = (domain_length, domain_length, domain_length)
 mesh = TreeMesh(coordinates_min, coordinates_max,
                 initial_refinement_level = cell,
                 n_cells_max = 1_000_000,
                 periodicity = true)
 
-semi = SemidiscretizationHyperbolic(mesh, equations, initial_condition, solver,
-                                    source_terms = source_terms,
-                                    boundary_conditions = boundary_condition_periodic)
+semi = SemidiscretizationHyperbolicParabolic(mesh, (equations, equations_parabolic),
+                                             initial_condition, solver,
+                                             source_terms = source_terms,
+                                             boundary_conditions = (boundary_condition_periodic,
+                                                                    boundary_condition_periodic))
 
 ###############################################################################
 # ODE solvers, callbacks etc.
@@ -271,7 +273,7 @@ analysis_callback = AnalysisCallback(semi, interval = analysis_interval,
 
 alive_callback = AliveCallback(analysis_interval = analysis_interval)
 
-save_solution = SaveSolutionCallback(interval = 400,
+save_solution = SaveSolutionCallback(interval = 200,
                                      save_initial_solution = true,
                                      save_final_solution = true,
                                      solution_variables = cons2prim,
@@ -295,6 +297,7 @@ callbacks = CallbackSet(summary_callback,
 ###############################################################################
 # run the simulation
 
+time_int_tol = 1e-8
 sol = solve(ode, CarpenterKennedy2N54(williamson_condition = false);
             dt = 1.0, # overwritten by stepsize_callback
             ode_default_options()..., callback = callbacks);

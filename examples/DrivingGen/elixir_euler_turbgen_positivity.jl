@@ -1,6 +1,6 @@
 using OrdinaryDiffEqLowStorageRK
 using OrdinaryDiffEqLowStorageRK: DiscreteCallback
-
+using OrdinaryDiffEqSSPRK
 using Printf
 
 include(joinpath(@__DIR__, "TurbGen.jl"))
@@ -8,7 +8,7 @@ using .TurbGen
 
 ###############################################################################
 # semidiscretization of the compressible Euler equations
-
+#
 equations = CompressibleEulerEquations3D(1.4)
 
 function initial_condition_uniform(x, t, equations::CompressibleEulerEquations3D)
@@ -27,9 +27,9 @@ initial_condition = initial_condition_uniform
 turb_velocity = 0.5       # target Mach number
 turb_sol_weight = 1.0     # solenoidal weight (1.0 = purely solenoidal)
 cell = 5
-name_addition = ""
+name_addition = "both_ranocha"
 num_cells = 2^cell
-polydeg = 4
+polydeg = 3
 
 domain_size = 1.0
 domain_size_label = "L$(domain_size)"
@@ -37,8 +37,8 @@ domain_size_label = "L$(domain_size)"
 prefix = "../../scratch/output/"
 
 run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_$(domain_size_label)_pd$(polydeg)_ver$(name_addition)"
-analysis_outdir = "Analysis_euler_shockcapturing_$(run_label)"
-solution_outdir = "out_euler_shockcapturing_$(run_label)"
+analysis_outdir = joinpath(prefix, "Analysis_euler_positivity_$(run_label)")
+solution_outdir = joinpath(prefix, "out_euler_positivity_$(run_label)")
 
 turb_gen = TurbGen.TurbGenGenerator()
 TurbGen.init_driving!(turb_gen,
@@ -68,7 +68,7 @@ function TurbulentForcing(generator)
     TurbulentForcing(generator, Array{SVector{3, Float64}, 4}(undef, 0, 0, 0, 0), -1)
 end
 
-# source term
+# source term (point-wise fallback)
 function (source::TurbulentForcing)(u, x, t, equations::CompressibleEulerEquations3D)
     rho, rho_v1, rho_v2, rho_v3, rho_e = u
     v1, v2, v3 = rho_v1 / rho, rho_v2 / rho, rho_v3 / rho
@@ -129,7 +129,6 @@ end
 source_terms = TurbulentForcing(turb_gen)
 
 ###############################################################################
-###############################################################################
 # custom analysis integrals for turbulence diagnostics
 
 # for RMS rho_v ^2
@@ -168,9 +167,6 @@ function Trixi.analyze(ip::InjectedPowerIntegral, du, u, t,
                        semi::Trixi.AbstractSemidiscretization)
     mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
 
-    # equations is a tuple (hyp, par) here since this is the NS case
-    eqs_hyp = equations isa Tuple ? equations[1] : equations
-
     src = ip.source
     nn = Trixi.nnodes(solver)
     ne = Trixi.nelements(solver, cache)
@@ -190,7 +186,7 @@ function Trixi.analyze(ip::InjectedPowerIntegral, du, u, t,
         for k in Trixi.eachnode(solver), j in Trixi.eachnode(solver),
             i in Trixi.eachnode(solver)
 
-            u_local = Trixi.get_node_vars(u, eqs_hyp, solver, i, j, k, element)
+            u_local = Trixi.get_node_vars(u, equations, solver, i, j, k, element)
             rho = u_local[1]
             v1 = u_local[2] / rho
             v2 = u_local[3] / rho
@@ -211,28 +207,22 @@ end
 # Pretty names for the analysis output file
 Trixi.pretty_form_utf(::InjectedPowerIntegral) = "∑P_inject"
 Trixi.pretty_form_ascii(::InjectedPowerIntegral) = "P_inject"
-###############################################################################
-# solver with shock capturing
 
-surface_flux = flux_lax_friedrichs
+###############################################################################
+# solver 
+
+surface_flux = flux_ranocha
 volume_flux = flux_ranocha
 
 basis = LobattoLegendreBasis(polydeg)
-indicator_sc = IndicatorHennemannGassner(equations, basis,
-                                         alpha_max = 0.5,
-                                         alpha_min = 0.001,
-                                         alpha_smooth = true,
-                                         variable = density_pressure)
-volume_integral = VolumeIntegralShockCapturingHG(indicator_sc;
-                                                 volume_flux_dg = volume_flux,
-                                                 volume_flux_fv = surface_flux)
+volume_integral = VolumeIntegralFluxDifferencing(volume_flux)
 solver = DGSEM(basis, surface_flux, volume_integral)
 
 ###############################################################################
 # mesh
 
 coordinates_min = (0.0, 0.0, 0.0)
-coordinates_max = (1.0, 1.0, 1.0)
+coordinates_max = (domain_size, domain_size, domain_size)
 mesh = TreeMesh(coordinates_min, coordinates_max,
                 initial_refinement_level = cell,
                 n_cells_max = 1_000_000,
@@ -252,6 +242,7 @@ summary_callback = SummaryCallback()
 
 analysis_interval = 200
 injected_power = InjectedPowerIntegral(source_terms)
+
 analysis_callback = AnalysisCallback(semi, interval = analysis_interval,
                                      save_analysis = true,
                                      output_directory = analysis_outdir,
@@ -277,7 +268,7 @@ save_solution = SaveSolutionCallback(interval = 400,
                                      solution_variables = cons2prim,
                                      output_directory = solution_outdir)
 
-stepsize_callback = StepsizeCallback(cfl = 0.5)
+stepsize_callback = StepsizeCallback(cfl = 0.4)
 
 # Update the OU process each timestep
 turbulence_callback = DiscreteCallback((u, t, integrator) -> true,
@@ -285,6 +276,11 @@ turbulence_callback = DiscreteCallback((u, t, integrator) -> true,
                                                                                 integrator.t);
                                                       nothing);
                                        save_positions = (false, false))
+
+# Positivity-preserving limiter
+positivity_limiter = PositivityPreservingLimiterZhangShu(thresholds = (1.0e-3, 1.0e-3),
+                                                         variables = (Trixi.density,
+                                                                      pressure))
 
 callbacks = CallbackSet(summary_callback,
                         analysis_callback, alive_callback,
@@ -295,6 +291,6 @@ callbacks = CallbackSet(summary_callback,
 ###############################################################################
 # run the simulation
 
-sol = solve(ode, CarpenterKennedy2N54(williamson_condition = false);
+sol = solve(ode, CarpenterKennedy2N54(positivity_limiter, williamson_condition = false);
             dt = 1.0, # overwritten by stepsize_callback
             ode_default_options()..., callback = callbacks);

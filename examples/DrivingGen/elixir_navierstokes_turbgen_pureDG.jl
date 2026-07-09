@@ -1,15 +1,20 @@
 using OrdinaryDiffEqLowStorageRK
 using OrdinaryDiffEqLowStorageRK: DiscreteCallback
-
+using OrdinaryDiffEqSSPRK
 using Printf
 
 include(joinpath(@__DIR__, "TurbGen.jl"))
 using .TurbGen
 
 ###############################################################################
-# semidiscretization of the compressible Euler equations
+# semidiscretization of the compressible Navier-Stokes equations
+
+prandtl_number() = 0.72
+mu = 5.0e-4
 
 equations = CompressibleEulerEquations3D(1.4)
+equations_parabolic = CompressibleNavierStokesDiffusion3D(equations, mu = mu,
+                                                          Prandtl = prandtl_number())
 
 function initial_condition_uniform(x, t, equations::CompressibleEulerEquations3D)
     rho = 1.0
@@ -27,20 +32,20 @@ initial_condition = initial_condition_uniform
 turb_velocity = 0.5       # target Mach number
 turb_sol_weight = 1.0     # solenoidal weight (1.0 = purely solenoidal)
 cell = 5
-name_addition = ""
+name_addition = "both_ranocha"
 num_cells = 2^cell
-polydeg = 4
+polydeg = 3
 
 domain_size = 1.0
 domain_size_label = "L$(domain_size)"
 
 prefix = "../../scratch/output/"
 
-run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_$(domain_size_label)_pd$(polydeg)_ver$(name_addition)"
-analysis_outdir = "Analysis_euler_shockcapturing_$(run_label)"
-solution_outdir = "out_euler_shockcapturing_$(run_label)"
+run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_$(domain_size_label)_pd$(polydeg)_mu$(mu)_pr$(prandtl_number())_ver$(name_addition)"
+analysis_outdir = joinpath(prefix, "Analysis_ns_pureDG_$(run_label)")
+solution_outdir = joinpath(prefix, "out_ns_pureDG_$(run_label)")
 
-turb_gen = TurbGen.TurbGenGenerator()
+turb_gen = TurbGen.TurbGenGenerator(seed = 42)
 TurbGen.init_driving!(turb_gen,
                       Dict{String, Any}("L" => [domain_size, domain_size, domain_size],
                                         "velocity" => turb_velocity,
@@ -68,7 +73,7 @@ function TurbulentForcing(generator)
     TurbulentForcing(generator, Array{SVector{3, Float64}, 4}(undef, 0, 0, 0, 0), -1)
 end
 
-# source term
+# source term (point-wise fallback)
 function (source::TurbulentForcing)(u, x, t, equations::CompressibleEulerEquations3D)
     rho, rho_v1, rho_v2, rho_v3, rho_e = u
     v1, v2, v3 = rho_v1 / rho, rho_v2 / rho, rho_v3 / rho
@@ -79,6 +84,40 @@ function (source::TurbulentForcing)(u, x, t, equations::CompressibleEulerEquatio
     return SVector(zero(eltype(u)),
                    rho * ax, rho * ay, rho * az,
                    rho * (v1 * ax + v2 * ay + v3 * az))
+end
+
+# fills accel_cache for every node, threaded over elements
+function _compute_turbgen_accel!(source_terms, dg, cache, node_coordinates, equations)
+    Trixi.@threaded for element in Trixi.eachelement(dg, cache)
+        for k in Trixi.eachnode(dg), j in Trixi.eachnode(dg), i in Trixi.eachnode(dg)
+            x_local = Trixi.get_node_coords(node_coordinates, equations, dg, i, j, k,
+                                            element)
+            accel = TurbGen.get_turb_vector(source_terms.generator, x_local)
+            source_terms.accel_cache[i, j, k, element] = SVector(accel[1], accel[2],
+                                                                 accel[3])
+        end
+    end
+    return nothing
+end
+
+# adds the cached acceleration into du, threaded over elements
+function _apply_turbgen_sources!(du, u, source_terms, equations, dg, cache)
+    Trixi.@threaded for element in Trixi.eachelement(dg, cache)
+        for k in Trixi.eachnode(dg), j in Trixi.eachnode(dg), i in Trixi.eachnode(dg)
+            u_local = Trixi.get_node_vars(u, equations, dg, i, j, k, element)
+            rho, rho_v1, rho_v2, rho_v3, rho_e = u_local
+            v1, v2, v3 = rho_v1 / rho, rho_v2 / rho, rho_v3 / rho
+
+            ax, ay, az = source_terms.accel_cache[i, j, k, element]
+
+            du_local = SVector(zero(eltype(u_local)),
+                               rho * ax, rho * ay, rho * az,
+                               rho * (v1 * ax + v2 * ay + v3 * az))
+
+            Trixi.add_to_node_vars!(du, du_local, equations, dg, i, j, k, element)
+        end
+    end
+    return nothing
 end
 
 function Trixi.calc_sources!(du, u, t, source_terms::TurbulentForcing,
@@ -95,40 +134,26 @@ function Trixi.calc_sources!(du, u, t, source_terms::TurbulentForcing,
 
     # Recompute acceleration field only when the OU process took a step
     if source_terms.cached_step != source_terms.generator.step
-        Trixi.@threaded for element in Trixi.eachelement(dg, cache)
-            for k in Trixi.eachnode(dg), j in Trixi.eachnode(dg), i in Trixi.eachnode(dg)
-                x_local = Trixi.get_node_coords(node_coordinates, equations, dg, i, j, k,
-                                                element)
-                accel = TurbGen.get_turb_vector(source_terms.generator, x_local)
-                source_terms.accel_cache[i, j, k, element] = SVector(accel[1], accel[2],
-                                                                     accel[3])
-            end
-        end
+        Trixi.@trixi_timeit Trixi.timer() "turbgen accel field" _compute_turbgen_accel!(source_terms,
+                                                                                        dg,
+                                                                                        cache,
+                                                                                        node_coordinates,
+                                                                                        equations)
         source_terms.cached_step = source_terms.generator.step
     end
 
     # Apply the source terms using the cached acceleration
-    Trixi.@threaded for element in Trixi.eachelement(dg, cache)
-        for k in Trixi.eachnode(dg), j in Trixi.eachnode(dg), i in Trixi.eachnode(dg)
-            u_local = Trixi.get_node_vars(u, equations, dg, i, j, k, element)
-            rho, rho_v1, rho_v2, rho_v3, rho_e = u_local
-            v1, v2, v3 = rho_v1 / rho, rho_v2 / rho, rho_v3 / rho
-
-            ax, ay, az = source_terms.accel_cache[i, j, k, element]
-
-            du_local = SVector(zero(eltype(u_local)),
-                               rho * ax, rho * ay, rho * az,
-                               rho * (v1 * ax + v2 * ay + v3 * az))
-
-            Trixi.add_to_node_vars!(du, du_local, equations, dg, i, j, k, element)
-        end
-    end
+    Trixi.@trixi_timeit Trixi.timer() "turbgen source application" _apply_turbgen_sources!(du,
+                                                                                           u,
+                                                                                           source_terms,
+                                                                                           equations,
+                                                                                           dg,
+                                                                                           cache)
 
     return nothing
 end
 source_terms = TurbulentForcing(turb_gen)
 
-###############################################################################
 ###############################################################################
 # custom analysis integrals for turbulence diagnostics
 
@@ -211,36 +236,32 @@ end
 # Pretty names for the analysis output file
 Trixi.pretty_form_utf(::InjectedPowerIntegral) = "∑P_inject"
 Trixi.pretty_form_ascii(::InjectedPowerIntegral) = "P_inject"
-###############################################################################
-# solver with shock capturing
 
-surface_flux = flux_lax_friedrichs
+###############################################################################
+# solver 
+
+surface_flux = flux_ranocha
 volume_flux = flux_ranocha
 
 basis = LobattoLegendreBasis(polydeg)
-indicator_sc = IndicatorHennemannGassner(equations, basis,
-                                         alpha_max = 0.5,
-                                         alpha_min = 0.001,
-                                         alpha_smooth = true,
-                                         variable = density_pressure)
-volume_integral = VolumeIntegralShockCapturingHG(indicator_sc;
-                                                 volume_flux_dg = volume_flux,
-                                                 volume_flux_fv = surface_flux)
+volume_integral = VolumeIntegralFluxDifferencing(volume_flux)
 solver = DGSEM(basis, surface_flux, volume_integral)
 
 ###############################################################################
 # mesh
 
 coordinates_min = (0.0, 0.0, 0.0)
-coordinates_max = (1.0, 1.0, 1.0)
+coordinates_max = (domain_size, domain_size, domain_size)
 mesh = TreeMesh(coordinates_min, coordinates_max,
                 initial_refinement_level = cell,
                 n_cells_max = 1_000_000,
                 periodicity = true)
 
-semi = SemidiscretizationHyperbolic(mesh, equations, initial_condition, solver,
-                                    source_terms = source_terms,
-                                    boundary_conditions = boundary_condition_periodic)
+semi = SemidiscretizationHyperbolicParabolic(mesh, (equations, equations_parabolic),
+                                             initial_condition, solver,
+                                             source_terms = source_terms,
+                                             boundary_conditions = (boundary_condition_periodic,
+                                                                    boundary_condition_periodic))
 
 ###############################################################################
 # ODE solvers, callbacks etc.
@@ -252,6 +273,7 @@ summary_callback = SummaryCallback()
 
 analysis_interval = 200
 injected_power = InjectedPowerIntegral(source_terms)
+
 analysis_callback = AnalysisCallback(semi, interval = analysis_interval,
                                      save_analysis = true,
                                      output_directory = analysis_outdir,
@@ -281,8 +303,8 @@ stepsize_callback = StepsizeCallback(cfl = 0.5)
 
 # Update the OU process each timestep
 turbulence_callback = DiscreteCallback((u, t, integrator) -> true,
-                                       integrator -> (TurbGen.check_for_update!(turb_gen,
-                                                                                integrator.t);
+                                       integrator -> (Trixi.@trixi_timeit Trixi.timer() "turbgen OU update" TurbGen.check_for_update!(turb_gen,
+                                                                                                                                      integrator.t);
                                                       nothing);
                                        save_positions = (false, false))
 

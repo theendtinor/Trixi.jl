@@ -1,4 +1,4 @@
-using OrdinaryDiffEq: DiscreteCallback
+using OrdinaryDiffEqLowStorageRK: DiscreteCallback
 using Plots
 using Printf
 
@@ -23,29 +23,31 @@ initial_condition = initial_condition_uniform
 ###############################################################################
 # turbulence generator (Ornstein-Uhlenbeck forcing)
 
-turb_velocity = 1.0       # target Mach number
+turb_velocity = 0.5       # target Mach number
 turb_sol_weight = 1.0     # solenoidal weight (1.0 = purely solenoidal)
-cell = 5
-name_addition = "lowDR"
+cell = 4
+name_addition = "rs1"
 num_cells = 2^cell
-polydeg = 3
+polydeg = 4
+domain_size = 1.0
+domain_size_label = "L$(domain_size)"
 
-run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_ver$(name_addition)"
-analysis_outdir = "Analysis_turbgen_subcell_$(run_label)"
-solution_outdir = "out_turbgen_subcell_$(run_label)"
-slices_outdir = "Slices_turbgen_subcell_$(run_label)"
+run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_$(domain_size_label)_pd$(polydeg)_ver$(name_addition)"
+analysis_outdir = "Analysis_euler_subcell_$(run_label)"
+solution_outdir = "out_euler_subcell_$(run_label)"
 
-turb_gen = TurbGen.TurbGenGenerator(seed = 42)
+turb_gen = TurbGen.TurbGenGenerator()
 TurbGen.init_driving!(turb_gen,
                       Dict{String, Any}("L" => [1.0, 1.0, 1.0],
                                         "velocity" => turb_velocity,
-                                        "k_driv" => 1,
-                                        "k_min" => 0.5,
-                                        "k_max" => 1.5,
+                                        "k_driv" => 1.5,
+                                        "k_min" => 1.0,
+                                        "k_max" => 2.0,
                                         "spectral_slope" => -5.0 / 3.0,
                                         "sol_weight" => turb_sol_weight,
-                                        "random_seed" => 42,
-                                        "nsteps_per_t_turb" => 10,
+                                        "spect_form" => 2,
+                                        "random_seed" => 1,
+                                        "nsteps_per_t_turb" => 100,
                                         "ampl_factor" => [1.0, 1.0, 1.0]))
 t_turnover = turb_gen.t_decay
 
@@ -133,18 +135,6 @@ rho_v3_squared(u, eq::CompressibleEulerEquations3D) = u[4]^2 / u[1]
 # for density variance
 density_squared(u, eq::CompressibleEulerEquations3D) = u[1]^2
 
-# Mach number M = |v|/c_s
-function mach_number_local(u, equations::CompressibleEulerEquations3D)
-    rho, rho_v1, rho_v2, rho_v3, rho_e = u
-    v1 = rho_v1 / rho
-    v2 = rho_v2 / rho
-    v3 = rho_v3 / rho
-    v_mag = sqrt(v1^2 + v2^2 + v3^2)
-    p = (equations.gamma - 1) * (rho_e - 0.5 * (rho_v1^2 + rho_v2^2 + rho_v3^2) / rho)
-    c_s = sqrt(equations.gamma * p / rho)
-    return v_mag / c_s
-end
-
 # M^2 = v^2/c_s^2
 function mach_squared(u, equations::CompressibleEulerEquations3D)
     rho, rho_v1, rho_v2, rho_v3, rho_e = u
@@ -157,6 +147,64 @@ function mach_squared(u, equations::CompressibleEulerEquations3D)
     cs_sq = equations.gamma * p / rho
     return v_sq / cs_sq
 end
+
+# power injected by the forcing, rho*(v.a). should roughly balance dissipation
+# once things settle into a statistically steady state
+struct InjectedPowerIntegral{S}
+    source::S
+end
+
+function (ip::InjectedPowerIntegral)(u, equations::CompressibleEulerEquations3D)
+    # no access to position here, so this can't do anything -- real work is in analyze() below
+    return zero(eltype(u))
+end
+
+# uses the cached acceleration instead of recomputing it per node
+function Trixi.analyze(ip::InjectedPowerIntegral, du, u, t,
+                       semi::Trixi.AbstractSemidiscretization)
+    mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
+
+    src = ip.source
+    nn = Trixi.nnodes(solver)
+    ne = Trixi.nelements(solver, cache)
+
+    # Make sure the acceleration cache is populated
+    if size(src.accel_cache) != (nn, nn, nn, ne)
+        return zero(real(eltype(u)))
+    end
+
+    w = solver.basis.weights
+    inv_jacobian = cache.elements.inverse_jacobian
+
+    total_power = zero(real(eltype(u)))
+    total_volume = zero(real(eltype(u)))
+    for element in Trixi.eachelement(solver, cache)
+        # TreeMesh: constant Jacobian per element
+        abs_J = abs(inv(inv_jacobian[element]))
+        for k in Trixi.eachnode(solver), j in Trixi.eachnode(solver),
+            i in Trixi.eachnode(solver)
+
+            u_local = Trixi.get_node_vars(u, equations, solver, i, j, k, element)
+            rho = u_local[1]
+            v1 = u_local[2] / rho
+            v2 = u_local[3] / rho
+            v3 = u_local[4] / rho
+
+            ax, ay, az = src.accel_cache[i, j, k, element]
+
+            dV = w[i] * w[j] * w[k] * abs_J
+            total_power += rho * (v1 * ax + v2 * ay + v3 * az) * dV
+            total_volume += dV
+        end
+    end
+
+    # divide by volume so this lines up with the other volume-averaged integrals
+    return total_power / total_volume
+end
+
+# Pretty names for the analysis output file
+Trixi.pretty_form_utf(::InjectedPowerIntegral) = "∑P_inject"
+Trixi.pretty_form_ascii(::InjectedPowerIntegral) = "P_inject"
 
 ###############################################################################
 # solver with subcell IDP shock capturing
@@ -196,23 +244,28 @@ ode = semidiscretize(semi, tspan)
 summary_callback = SummaryCallback()
 
 analysis_interval = 200
+injected_power = InjectedPowerIntegral(source_terms)
+
 analysis_callback = AnalysisCallback(semi, interval = analysis_interval,
                                      save_analysis = true,
                                      output_directory = analysis_outdir,
                                      analysis_errors = Symbol[],
-                                     extra_analysis_integrals = (energy_kinetic,
+                                     extra_analysis_integrals = (energy_total,
+                                                                 energy_kinetic,
+                                                                 energy_internal,
+                                                                 injected_power,
                                                                  rho_v1_squared,
                                                                  rho_v2_squared,
                                                                  rho_v3_squared,
                                                                  Trixi.density,
                                                                  density_squared,
-                                                                 mach_number_local,
+                                                                 pressure,
                                                                  mach_squared,
                                                                  entropy))
 
 alive_callback = AliveCallback(analysis_interval = analysis_interval)
 
-save_solution = SaveSolutionCallback(interval = 200,
+save_solution = SaveSolutionCallback(interval = 250,
                                      save_initial_solution = true,
                                      save_final_solution = true,
                                      solution_variables = cons2prim,
@@ -228,35 +281,10 @@ turbulence_callback = DiscreteCallback((u, t, integrator) -> true,
                                                       nothing);
                                        save_positions = (false, false))
 
-# Save z=0.5 slice plots of primitive variables at each analysis interval
-mkpath(slices_outdir)
-function save_slice_plot(plot_data, variable_names;
-                         show_mesh = true, plot_arguments = Dict{Symbol, Any}(),
-                         time = nothing, timestep = nothing)
-    plots = [Plots.plot(plot_data[v]; title = v, plot_arguments...) for v in variable_names]
-    cols = ceil(Int, sqrt(length(plots)))
-    rows = div(length(plots), cols, RoundUp)
-    Plots.plot(plots..., layout = (rows, cols), size = (400 * cols, 350 * rows))
-    Plots.savefig(joinpath(slices_outdir, @sprintf("slice_z05_%09d.png", timestep)))
-end
-
-visualization_callback = VisualizationCallback(semi,
-                                               (u, semi; kwargs...) -> PlotData2D(u, semi;
-                                                                                  slice = :xy,
-                                                                                  point = (0.0,
-                                                                                           0.0,
-                                                                                           0.5),
-                                                                                  kwargs...);
-                                               interval = 200,
-                                               solution_variables = cons2prim,
-                                               show_mesh = false,
-                                               plot_creator = save_slice_plot)
-
 callbacks = CallbackSet(summary_callback,
                         analysis_callback, alive_callback,
                         save_solution,
                         stepsize_callback,
-                        visualization_callback,
                         turbulence_callback)
 
 ###############################################################################
