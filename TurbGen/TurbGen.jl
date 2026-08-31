@@ -1,5 +1,4 @@
-
-#Original C++ code: https://github.com/chfeder/turbulence_generator
+# Reference implementation: https://github.com/chfeder/turbulence_generator
 
 module TurbGen
 
@@ -10,55 +9,47 @@ export TurbGenGenerator,
        check_for_update!,
        get_turb_vector
 
-# coordinate indices
 const X, Y, Z = 1, 2, 3
 
-const MAX_NMODES = 100_000
-
-# ============================================================================
-# Main generator struct
-# ============================================================================
+const MAX_NMODES = 100_000  
 
 mutable struct TurbGenGenerator
-    # domain
-    L::Vector{Float64}
+    L::Vector{Float64}    # box side lengths
 
-    # mode arrays: mode[dim][mode_index]
+    # wave vectors, mode[dim][mode_index]
     mode::Vector{Vector{Float64}}
 
-    # Fourier coefficients after Helmholtz decomposition
-    aka::Vector{Vector{Float64}}  # cosine (real) part
-    akb::Vector{Vector{Float64}}  # sine (imaginary) part
+    # Fourier coefficients after the Helmholtz decomposition (aka real, akb imaginary)
+    aka::Vector{Vector{Float64}}
+    akb::Vector{Vector{Float64}}
 
-    # OU phases, layout: OUphases[6*(m-1) + 2*(d-1) + ir]
-    # m = mode, d = dim (1:3), ir = 1 (real) or 2 (imag)
+    # OU phases, flattened: OUphases[6*(m-1) + 2*(d-1) + ir], ir=1 real, ir=2 imag
     OUphases::Vector{Float64}
 
-    # spectral amplitude weights
-    ampl::Vector{Float64}
+    ampl::Vector{Float64}  # spectral weight per mode
 
     nmodes::Int
     random_seed::Int
 
-    kmin::Float64
+    kmin::Float64            # driven range in k, both already scaled by 2pi/L
     kmax::Float64
-    spectral_slope::Float64
+    spectral_slope::Float64  # exponent of E(k) ~ k^slope, only used by spect_form 2
 
-    sol_weight::Float64
-    sol_weight_norm::Float64
-    spect_form::Int          # 0: band/flat, 1: parabola, 2: power law
+    sol_weight::Float64       # 1 = purely solenoidal, 0 = purely compressive forcing
+    sol_weight_norm::Float64  # keeps RMS forcing independent of sol_weight (Eq. 9)
+    spect_form::Int           # 0 = band, 1 = parabola, 2 = power law
 
-    velocity::Float64
-    t_decay::Float64
-    dt::Float64
-    energy::Float64
-    OUvar::Float64
+    velocity::Float64  # target RMS velocity of the driven turbulence
+    t_decay::Float64   # correlation time of the OU process, one eddy turnover
+    dt::Float64        # time between two OU updates
+    energy::Float64    # energy injection rate
+    OUvar::Float64     # standard deviation of the OU phases
 
-    nsteps_per_t_turb::Int
-    step::Int
+    nsteps_per_t_turb::Int  # OU updates per turnover time, sets dt
+    step::Int               # index of the last OU update, -1 before the first one
 
-    ampl_factor::Vector{Float64}
-    ampl_auto_adjust::Bool
+    ampl_factor::Vector{Float64}  # per-direction scaling of the forcing amplitude
+    ampl_auto_adjust::Bool        # rescale ampl_factor towards the target velocity
 
     rng::MersenneTwister
 end
@@ -74,7 +65,7 @@ function TurbGenGenerator(; seed::Int = 140281)
                      seed,
                      0.0, 0.0,
                      -5 / 3,
-                     2, #spect_form
+                     2,  # spect_form
                      0.5, 1.0,
                      1.0, 1.0, 0.1, 1.0, 1.0,
                      10, -1,
@@ -83,30 +74,21 @@ function TurbGenGenerator(; seed::Int = 140281)
                      MersenneTwister(seed))
 end
 
-# ============================================================================
-# Solenoidal weight normalisation
-# Makes the RMS of the field independent of sol_weight.
-# See Eq. 9 in Federrath et al. (2010).
-# ============================================================================
+# normalisation
 function set_solenoidal_weight_normalisation!(gen::TurbGenGenerator)
     zeta = gen.sol_weight
     gen.sol_weight_norm = sqrt(3.0) / sqrt(1 - 2 * zeta + 3 * zeta^2)
 end
 
-# ============================================================================
-# Initialise modes and amplitudes
-# Loops over all integer (ikx, iky, ikz) combinations and keeps those with
-# |k| in [kmin, kmax]. Amplitudes follow a power-law: (|k|/k_ref)^(slope/2).
-# ============================================================================
+
 function init_modes!(gen::TurbGenGenerator)
     (; kmin, kmax, spectral_slope, spect_form, L) = gen
 
-    # band & power law reference kmin; parabola peaks at the band midpoint.
-    kc = spect_form == 1 ? 0.5 * (kmin + kmax) : kmin
+    kc = spect_form == 1 ? 0.5 * (kmin + kmax) : kmin  # ref wavenumber
     parab_prefact = kmax > kmin ? -4.0 / (kmax - kmin)^2 : 0.0
     ikmax = 256
 
-    # count first to check against MAX_NMODES
+
     nmodes_count = 0
     for ikx in (-ikmax):ikmax
         kx = 2pi * ikx / L[X]
@@ -141,12 +123,11 @@ function init_modes!(gen::TurbGenGenerator)
                 ka = sqrt(kx^2 + ky^2 + kz^2)
 
                 if ka >= kmin && ka <= kmax
-                    # spectral amplitude (power spectrum ~ amplitude^2)
                     if spect_form == 0          # band / flat
                         amplitude = 1.0
                     elseif spect_form == 1      # parabola
                         amplitude = abs(parab_prefact * (ka - kc)^2 + 1.0)
-                    else                        # power law (spect_form == 2)
+                    else                        # power law
                         amplitude = (ka / kc)^spectral_slope
                     end
 
@@ -163,9 +144,7 @@ function init_modes!(gen::TurbGenGenerator)
     end
 end
 
-# ============================================================================
-# Initialise OU phases from a Gaussian with std = OUvar
-# ============================================================================
+# draw the initial OU phases from a Gaussian with standard deviation OUvar
 function OU_noise_init!(gen::TurbGenGenerator)
     (; nmodes, OUvar) = gen
     resize!(gen.OUphases, nmodes * 3 * 2)
@@ -179,12 +158,8 @@ function OU_noise_init!(gen::TurbGenGenerator)
     end
 end
 
-# ============================================================================
-# Advance OU sequence by one step.
-# x_{n+1} = f * x_n + sigma * sqrt(1 - f^2) * z_n
-# where f = exp(-dt/t_decay), z_n ~ N(0,1).
-# See Eswaran & Pope (1988), Federrath et al. (2010) Eq. (4).
-# ============================================================================
+# one Euler-Maruyama-exact step of the OU process,
+# x_{n+1} = f*x_n + sigma*sqrt(1-f^2)*N(0,1), f = exp(-dt/t_decay)
 function OU_noise_update!(gen::TurbGenGenerator)
     (; nmodes, dt, t_decay, OUvar) = gen
 
@@ -202,11 +177,8 @@ function OU_noise_update!(gen::TurbGenGenerator)
     end
 end
 
-# ============================================================================
-# Helmholtz decomposition.
-# Splits the OU vector field into solenoidal (div-free) and compressive
-# (curl-free) parts, weighted by sol_weight. See Eq. (6) Federrath+ (2010).
-# ============================================================================
+# Helmholtz decomposition of the OU vector: split it into a divergence-free and a
+# curl-free part in Fourier space and mix the two with the weight sol_weight
 function get_decomposition_coeffs!(gen::TurbGenGenerator)
     (; nmodes, sol_weight, mode, OUphases) = gen
 
@@ -243,15 +215,8 @@ function get_decomposition_coeffs!(gen::TurbGenGenerator)
     end
 end
 
-# ============================================================================
-# init_driving!
-# Sets up all internal data from the parameter dict. Call this before
-# check_for_update! or get_turb_vector.
-#
-# Required keys: L, velocity, k_driv, sol_weight, random_seed
-# Optional keys: k_min, k_max, spectral_slope, nsteps_per_t_turb,
-#                ampl_factor, ampl_auto_adjust
-# ============================================================================
+# set up box, spectrum and OU parameters from a parameter dict and build the initial
+# mode set. must run before the first check_for_update!
 function init_driving!(gen::TurbGenGenerator, params::Dict{String, Any};
                        time::Float64 = 0.0)
     L = get(params, "L", [1.0, 1.0, 1.0])
@@ -279,7 +244,7 @@ function init_driving!(gen::TurbGenGenerator, params::Dict{String, Any};
 
     gen.rng = MersenneTwister(gen.random_seed)
 
-    # small epsilon so [k_min, k_max] boundaries are inclusive
+    # nudge kmin/kmax by eps so modes sitting right on the boundary don't get dropped
     gen.kmin = (k_min - eps()) * 2pi / gen.L[X]
     gen.kmax = (k_max + eps()) * 2pi / gen.L[X]
 
@@ -287,12 +252,10 @@ function init_driving!(gen::TurbGenGenerator, params::Dict{String, Any};
     gen.dt = gen.t_decay / gen.nsteps_per_t_turb
     gen.step = -1
 
-    # 0.15 is calibrated for Mach~1, natural mixture to match target velocity
-    ampl_coeff = 0.15
+    ampl_coeff = 0.15  # empirical prefactor
     gen.energy = (ampl_coeff * gen.velocity)^3 / gen.L[X]
     gen.OUvar = sqrt(gen.energy / gen.t_decay)
 
-    # raise to 1.5 so the user can specify ampl_factor as a velocity ratio
     for d in 1:3
         gen.ampl_factor[d] = gen.ampl_factor[d]^1.5
     end
@@ -305,12 +268,8 @@ function init_driving!(gen::TurbGenGenerator, params::Dict{String, Any};
     return nothing
 end
 
-# ============================================================================
-# check_for_update!
-# Advances the OU process to the step corresponding to the requested time.
-# Optionally adjusts ampl_factor to hit the target velocity (ampl_auto_adjust).
-# Returns true if the pattern was updated.
-# ============================================================================
+# advance the OU process up to `time` and refresh the Fourier coeffs if a step
+# actually happened. returns whether anything changed
 function check_for_update!(gen::TurbGenGenerator, time::Float64;
                            v_turb::Union{Vector{Float64}, Nothing} = nothing)
     step_requested = floor(Int, time / gen.dt)
@@ -319,7 +278,6 @@ function check_for_update!(gen::TurbGenGenerator, time::Float64;
         return false
     end
 
-    # auto-adjust amplitude to reach target velocity
     if gen.ampl_auto_adjust && v_turb !== nothing && v_turb[X] > 0
         if time > 0.1 * gen.t_decay
             for d in 1:3
@@ -335,7 +293,6 @@ function check_for_update!(gen::TurbGenGenerator, time::Float64;
         end
     end
 
-    # step OU forward
     for _ in (gen.step):(step_requested - 1)
         OU_noise_update!(gen)
         gen.step += 1
@@ -346,15 +303,8 @@ function check_for_update!(gen::TurbGenGenerator, time::Float64;
     return true
 end
 
-# ============================================================================
-# get_turb_vector
-# Returns the turbulent velocity (vx, vy, vz) at position pos by summing
-# over all Fourier modes:
-#
-#   v(x) = sum_m  2 * sol_weight_norm * ampl[m] * (aka[m]*cos(k.x) - akb[m]*sin(k.x))
-#
-# The factor of 2 comes from the complex exponential representation.
-# ============================================================================
+# direct Fourier sum for the forcing field at `pos`. the factor of 2 comes from
+# only summing over half the modes 
 function get_turb_vector(gen::TurbGenGenerator, pos)
     (; nmodes, sol_weight_norm, mode, ampl, aka, akb, ampl_factor) = gen
 
@@ -373,6 +323,7 @@ function get_turb_vector(gen::TurbGenGenerator, pos)
 
         A = 2 * sol_weight_norm * ampl[m]
 
+        # real and imaginary part of exp(i k.x), expanded from the three sincos pairs
         real_part = (cosx * cosy - sinx * siny) * cosz - (sinx * cosy + cosx * siny) * sinz
         imag_part = cosx * (cosy * sinz + siny * cosz) + sinx * (cosy * cosz - siny * sinz)
 

@@ -1,4 +1,4 @@
-using OrdinaryDiffEqLowStorageRK: DiscreteCallback
+using OrdinaryDiffEqLowStorageRK
 
 include(joinpath(@__DIR__, "..", "TurbGen.jl"))
 using .TurbGen
@@ -7,14 +7,9 @@ include(joinpath(@__DIR__, "..", "run_logging.jl"))
 using .RunLog
 
 ###############################################################################
-# semidiscretization of the compressible Navier-Stokes equations
+# semidiscretization of the compressible Euler equations
 
-prandtl_number() = 0.72
-mu = 5.0e-7
-
-equations = CompressibleEulerEquations3D(1.0001)   # gamma ~ 1: near-isothermal
-equations_parabolic = CompressibleNavierStokesDiffusion3D(equations, mu = mu,
-                                                          Prandtl = prandtl_number())
+equations = CompressibleEulerEquations3D(1.0001)
 
 function initial_condition_uniform(x, t, equations::CompressibleEulerEquations3D)
     rho = 1.0
@@ -30,34 +25,31 @@ initial_condition = initial_condition_uniform
 ###############################################################################
 # turbulence generator (Ornstein-Uhlenbeck forcing)
 
-turb_velocity = 0.3       # target Mach number (M ~ 0.3)
+turb_velocity = 0.5       # target Mach number
 turb_sol_weight = 1.0     # solenoidal weight (1.0 = purely solenoidal)
 cell = 5
-name_addition = "_isothermal_M0.3"
+name_addition = "isothermal"
 num_cells = 2^cell
 polydeg = 3
 domain_length = 1.0
-prefix = "../../scratch/output/test/"
 
-run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_L$(domain_length)_pd$(polydeg)_mu$(mu)_pr$(prandtl_number())_ver$(name_addition)"
+run_label = "v$(turb_velocity)_sol$(turb_sol_weight)_cells$(num_cells)_L$(domain_length)_pd$(polydeg)_ver$(name_addition)"
+analysis_outdir = "Analysis_euler_shockcapturing_$(run_label)"
+solution_outdir = "out_euler_shockcapturing_$(run_label)"
 
-analysis_outdir = joinpath(prefix, "Analysis_ns_subcell_$(run_label)")
-solution_outdir = joinpath(prefix, "out_ns_subcell_$(run_label)")
-turb_gen = TurbGen.TurbGenGenerator(seed = 42)
+turb_gen = TurbGen.TurbGenGenerator()
 TurbGen.init_driving!(turb_gen,
                       Dict{String, Any}("L" => [domain_length, domain_length, domain_length],
                                         "velocity" => turb_velocity,
                                         "k_driv" => 2.0,       # = k_max, so t_decay = T
-                                        "k_min" => 1.0,   # kmin = 2*pi*1
-                                        "k_max" => 2.0,   # kmax = 2*pi*2
+                                        "k_min" => 1.0,        # fundamental mode 2*pi/L
+                                        "k_max" => 2.0,        # first harmonic 4*pi/L
                                         "spectral_slope" => -5.0 / 3.0,
                                         "sol_weight" => turb_sol_weight,
-                                        "spect_form" => 2,
-                                        "random_seed" => 42,
+                                        "spect_form" => 0,
+                                        "random_seed" => 1,
                                         "nsteps_per_t_turb" => 100,
                                         "ampl_factor" => [1.0, 1.0, 1.0]))
-# with k_driv = k_max the OU correlation time coincides with the eddy turnover time
-# on the injection scale, T = L / (2 * cs * M), so a single timescale covers both
 t_turnover = turb_gen.t_decay
 
 ###############################################################################
@@ -162,8 +154,7 @@ function mach_squared(u, equations::CompressibleEulerEquations3D)
     return v_sq / cs_sq
 end
 
-# power injected by the forcing, rho*(v.a). should roughly balance dissipation
-# once things settle into a statistically steady state
+# power injected by the forcing, rho*(v.a)
 struct InjectedPowerIntegral{S}
     source::S
 end
@@ -189,6 +180,7 @@ function _injected_power(src, u, eqs_hyp, solver, cache)
     total_power = zero(real(eltype(u)))
     total_volume = zero(real(eltype(u)))
     for element in Trixi.eachelement(solver, cache)
+        # TreeMesh: constant Jacobian per element
         abs_J = abs(inv(inv_jacobian[element]))
         for k in Trixi.eachnode(solver), j in Trixi.eachnode(solver),
             i in Trixi.eachnode(solver)
@@ -215,22 +207,16 @@ function Trixi.analyze(ip::InjectedPowerIntegral, du, u, t,
                        semi::Trixi.AbstractSemidiscretization)
     mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
 
-    # equations is a tuple (hyp, par)
-    eqs_hyp = equations isa Tuple ? equations[1] : equations
-
     return Trixi.@trixi_timeit Trixi.timer() "turbgen injected power" begin
-        _injected_power(ip.source, u, eqs_hyp, solver, cache)
+        _injected_power(ip.source, u, equations, solver, cache)
     end
 end
 
-# Pretty names for the analysis output file
 Trixi.pretty_form_utf(::InjectedPowerIntegral) = "P_inject"
 Trixi.pretty_form_ascii(::InjectedPowerIntegral) = "P_inject"
 
-# tracking how much energy the isothermal reset pulls out (following the
-# dissipation definition used in Bauer & Springel 2012). every step we reset
-# rho_e back to the target, so eps_diss = energy removed, eps_cool = energy
-# added back in the (frequent) cases where the reset goes the other way.
+###############################################################################
+# Dissipation tracking (energy extracted by the isothermal reset).
 
 mutable struct DissipationAccumulator
     total::Float64           # running volume-integral of dissipated energy since t=0
@@ -247,12 +233,10 @@ struct DissipatedPowerIntegral
     domain_volume::Float64
 end
 
-# unused, Trixi.analyze below is what actually gets called
 function (dp::DissipatedPowerIntegral)(u, equations::CompressibleEulerEquations3D)
     return zero(eltype(u))
 end
 
-# mean rate since the last analysis call, then move the reference point up
 function Trixi.analyze(dp::DissipatedPowerIntegral, du, u, t,
                        semi::Trixi.AbstractSemidiscretization)
     dt_interval = t - dp.accum.t_last_report
@@ -309,19 +293,22 @@ function integration_measure(semi)
     end
     return V
 end
+
 ###############################################################################
-# solver with subcell IDP shock capturing
+# solver with shock capturing (Hennemann-Gassner indicator)
 
 surface_flux = flux_lax_friedrichs
 volume_flux = flux_ranocha
 
 basis = LobattoLegendreBasis(polydeg)
-limiter_idp = SubcellLimiterIDP(equations, basis;
-                                positivity_variables_cons = ["rho"],
-                                positivity_variables_nonlinear = [pressure])
-volume_integral = VolumeIntegralSubcellLimiting(limiter_idp;
-                                                volume_flux_dg = volume_flux,
-                                                volume_flux_fv = surface_flux)
+indicator_sc = IndicatorHennemannGassner(equations, basis,
+                                         alpha_max = 0.5,
+                                         alpha_min = 0.001,
+                                         alpha_smooth = true,
+                                         variable = density_pressure)
+volume_integral = VolumeIntegralShockCapturingHG(indicator_sc;
+                                                 volume_flux_dg = volume_flux,
+                                                 volume_flux_fv = surface_flux)
 solver = DGSEM(basis, surface_flux, volume_integral)
 
 ###############################################################################
@@ -334,16 +321,13 @@ mesh = TreeMesh(coordinates_min, coordinates_max,
                 n_cells_max = 1_000_000,
                 periodicity = true)
 
-semi = SemidiscretizationHyperbolicParabolic(mesh, (equations, equations_parabolic),
-                                             initial_condition, solver,
-                                             source_terms = source_terms,
-                                             boundary_conditions = (boundary_condition_periodic,
-                                                                    boundary_condition_periodic))
+semi = SemidiscretizationHyperbolic(mesh, equations, initial_condition, solver,
+                                    source_terms = source_terms,
+                                    boundary_conditions = boundary_condition_periodic)
 
 ###############################################################################
 # ODE solvers, callbacks etc.
 
-# ~3 turnover times to spin up + 5 to collect statistics
 n_turnovers = 8.0
 tspan = (0.0, n_turnovers * t_turnover)
 ode = semidiscretize(semi, tspan)
@@ -356,6 +340,7 @@ diss_accum = DissipationAccumulator()
 V_meas = integration_measure(semi)
 dissipated_power = DissipatedPowerIntegral(diss_accum, V_meas)
 cooling_power = CoolingPowerIntegral(diss_accum, V_meas)
+
 analysis_callback = AnalysisCallback(semi, interval = analysis_interval,
                                      save_analysis = true,
                                      output_directory = analysis_outdir,
@@ -377,13 +362,12 @@ analysis_callback = AnalysisCallback(semi, interval = analysis_interval,
 
 alive_callback = AliveCallback(analysis_interval = analysis_interval)
 
-save_solution_interval = 400
+save_solution_interval = 250
 save_solution = SaveSolutionCallback(interval = save_solution_interval,
                                      save_initial_solution = true,
                                      save_final_solution = true,
                                      solution_variables = cons2prim,
-                                     output_directory = solution_outdir,
-                                     extra_node_variables = (:limiting_coefficient,))
+                                     output_directory = solution_outdir)
 
 cfl = 0.5
 stepsize_callback = StepsizeCallback(cfl = cfl)
@@ -400,13 +384,9 @@ turbulence_callback = DiscreteCallback((u, t, integrator) -> true, update_turbul
                                        save_positions = (false, false))
 
 ###############################################################################
+# isothermal reset: overwrite rho_e every step so cs stays at cs_target.
+# gamma is ~1.0001 here so p ~ rho*cs^2, that's basically what this enforces
 
-# isothermal reset: every step, overwrite rho_e so the local sound speed is
-# cs_target everywhere (density/momentum untouched). cheaper than an actual
-# isothermal Riemann solver, same idea as Bauer & Springel 2012.
-# p_reset = rho*cs_target^2/gamma, rho_e = p_reset/(gamma-1) + kinetic part
-
-# with rho=1, p=1/gamma initially, cs^2 = gamma*p/rho = 1 already, so cs_target=1
 const cs_target = 1.0   # target isothermal sound speed
 
 # Overwrite rho_e at every step so the internal energy matches cs_target while
@@ -478,22 +458,20 @@ callbacks = CallbackSet(summary_callback,
 ###############################################################################
 # run the simulation
 
-stage_callbacks = (SubcellLimiterIDPCorrection(), BoundsCheckCallback())
-
 console_log = RunLog.start_console_log(joinpath(solution_outdir, "console_output.txt"))
 
 # the SummaryCallback already prints mesh, equations and solver
 RunLog.print_settings("Run: " * basename(@__FILE__);
                       RunLog.environment()..., run_label, analysis_outdir,
                       solution_outdir, analysis_interval, save_solution_interval,
-                      gamma = equations.gamma, mu, Prandtl = prandtl_number(), cs_target,
-                      domain_length, num_cells, polydeg, cfl, n_turnovers, tspan)
+                      gamma = equations.gamma, cs_target, domain_length, num_cells,
+                      polydeg, cfl, n_turnovers, tspan)
 RunLog.print_settings("Turbulence driving"; RunLog.turbgen_settings(turb_gen)...)
 
 try
-    global sol = Trixi.solve(ode, Trixi.SimpleSSPRK33(stage_callbacks = stage_callbacks);
-                             dt = 1.0, # overwritten by stepsize_callback
-                             callback = callbacks)
+    global sol = solve(ode, CarpenterKennedy2N54(williamson_condition = false);
+                       dt = 1.0, # overwritten by stepsize_callback
+                       ode_default_options()..., callback = callbacks)
 finally
     RunLog.stop_console_log(console_log)
 end

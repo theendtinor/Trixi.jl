@@ -1,7 +1,21 @@
-using StaticArrays
 using FFTW
 using LinearAlgebra: mul!
 using Base.Threads
+
+# Spectrum convention:
+#
+#   E_v(k) = (L / 2pi)^3 |v_hat(k)|^2      (single Fourier mode)
+#   E(k)   = 4 pi k^2 <E_v(k)>             (shell-averaged spectrum)
+
+
+# number of k-space lattice modes per unit |k| in a thin shell at k
+_modes_per_dk(k, L) = 4 * pi * k^2 * (L / (2 * pi))^3
+
+# E(k) from the power summed over a shell and the number of modes it contains
+function _spectral_density(k, power_sum, n_modes, L)
+    n_modes == 0 && return 0.0
+    return _modes_per_dk(k, L) * power_sum / n_modes
+end
 
 # --- helpers ---
 
@@ -34,8 +48,7 @@ function _build_cell_lookup(mesh::Trixi.TreeMesh, cache)
     return lookup, x0, dx_cell
 end
 
-# workspace holding the velocity grids, FFT plan and the Fourier arrays, so we
-# don't re-allocate this stuff for every snapshot
+# workspace holding the velocity grids, FFT plan and the Fourier arrays
 
 struct PSWorkspace{P}
     vx::Array{Float64, 3}
@@ -54,7 +67,6 @@ function PSWorkspace(N_grid::Int, L::Float64)
     vy = zeros(Float64, N_grid, N_grid, N_grid)
     vz = zeros(Float64, N_grid, N_grid, N_grid)
 
-    # MEASURE plan costs a few seconds up front but pays off over many snapshots
     plan = plan_rfft(vx; flags = FFTW.MEASURE)
 
     n_kx = div(N_grid, 2) + 1
@@ -65,10 +77,8 @@ function PSWorkspace(N_grid::Int, L::Float64)
     return PSWorkspace(vx, vy, vz, fvx, fvy, fvz, plan, N_grid, L)
 end
 
-# caches mesh/solver geometry (nodes, lookup table, lag1d) so we don't need to
-# trixi_include on every run -- only depends on (N_cells, polydeg, L).
-# save/load logic lives in ps_geometry_cache.jl, struct is defined here so the
-# measure_PS overloads below can use it
+# caches mesh/solver geometry (nodes, lookup table, lag1d), only depends on (N_cells, polydeg, L).
+# save/load logic lives in ps_geometry_cache.jl
 
 struct PSGeometryCache
     nodes::Vector{Float64}       # GLL nodes on [-1,1], length = polydeg+1
@@ -89,327 +99,86 @@ function allocate_workspace(semi)
     return PSWorkspace(N_grid, L)
 end
 
-# same thing but from a cache, no semi needed
+# same thing but from a cache
 function allocate_workspace(cache::PSGeometryCache)
     return PSWorkspace(cache.N_grid, cache.L)
 end
 
-# tensor-product interpolation done as 3 separate 1D passes instead of one
-# big 3D contraction, much faster
-
-function _vel_to_grid_fast!(ws::PSWorkspace, u, mesh::Trixi.TreeMesh,
-                            equations, solver, cache)
-    N_grid = ws.N_grid
-    vx, vy, vz = ws.vx, ws.vy, ws.vz
-
-    fill!(vx, 0.0)
-    fill!(vy, 0.0)
-    fill!(vz, 0.0)
-
-    nodes = solver.basis.nodes
-    bary_w = Trixi.barycentric_weights(nodes)
-    n = length(nodes)   # n_nodes = polydeg + 1
-    N_cells = _cells_per_dim(mesh)
-
-    lookup, x0, dx_cell = _build_cell_lookup(mesh, cache)
-
-    # --- precompute 1D interpolation weights for each sub-point ----
-    # lag1d[s+1][i]  =  L_i(xi_s),  s in 0:n-1,  i in 1:n
-    half_cell = dx_cell / 2
-    lag1d = Vector{Vector{Float64}}(undef, n)
-    for s in 0:(n - 1)
-        xi = ((s + 0.5) / n * dx_cell - half_cell) / half_cell
-        lag1d[s + 1] = Trixi.lagrange_interpolating_polynomials(xi, nodes, bary_w)
+# Tensor-product Lagrange interpolation of one DG cell onto its nn^3 uniform
+# sub-cell points. The interpolation is
+#
+#   out(sx, sy, sz) = sum_{i,j,k} lag[sx,i] lag[sy,j] lag[sz,k] * u[i,j,k],
+#
+# which we evaluate as three successive 1D contractions (sum factorisation), one
+# per direction, instead of the full triple sum. A and B are scratch buffers for the two intermediate stages.
+function _interpolate_cell!(grid, u, base, cx, cy, cz, nn, lag, A, B)
+    # pass 1: contract i  ->  A[sx, j, k]
+    @inbounds for k in 1:nn, j in 1:nn, sx in 1:nn
+        acc = 0.0
+        for i in 1:nn
+            acc += lag[sx, i] * u[base + i + (j - 1) * nn + (k - 1) * nn^2]
+        end
+        A[sx, j, k] = acc
     end
 
-    # --- threaded loop over cells ---
-    total_cells = N_cells^3
-    @threads for linear_idx in 1:total_cells
-        rem1 = linear_idx - 1
-        cz_m1, rem2 = divrem(rem1, N_cells^2)
-        cy_m1, cx_m1 = divrem(rem2, N_cells)
-        cx = cx_m1 + 1
-        cy = cy_m1 + 1
-        cz = cz_m1 + 1
-
-        eid = lookup[cx, cy, cz]
-
-        # ---- factored interpolation: 3 passes per sub-point ----
-        # We interpolate 4 conservative vars (rho, rho*v1, rho*v2, rho*v3)
-        # then convert to primitive at the very end.
-        #
-        # pass 1 (over i): tmp1[j, k, var] = sum_i  L_i(xi_sx) * u[var, i, j, k, eid]
-        # pass 2 (over j): tmp2[k, var]     = sum_j  L_j(xi_sy) * tmp1[j, k, var]
-        # pass 3 (over k): val[var]          = sum_k  L_k(xi_sz) * tmp2[k, var]
-
-        # stack-allocate small work arrays
-        tmp1 = MArray{Tuple{4, n, n}, Float64}(undef)  # [var, j, k]
-
-        for sz in 0:(n - 1)
-            iz = (cz - 1) * n + sz + 1
-            wz = lag1d[sz + 1]
-
-            for sy in 0:(n - 1)
-                iy = (cy - 1) * n + sy + 1
-                wy = lag1d[sy + 1]
-
-                for sx in 0:(n - 1)
-                    ix = (cx - 1) * n + sx + 1
-                    wx = lag1d[sx + 1]
-
-                    # --- pass 1: contract over i ---
-                    @inbounds for kk in 1:n, jj in 1:n
-                        r = 0.0
-                        m1 = 0.0
-                        m2 = 0.0
-                        m3 = 0.0
-                        for ii in 1:n
-                            w = wx[ii]
-                            r += u[1, ii, jj, kk, eid] * w
-                            m1 += u[2, ii, jj, kk, eid] * w
-                            m2 += u[3, ii, jj, kk, eid] * w
-                            m3 += u[4, ii, jj, kk, eid] * w
-                        end
-                        tmp1[1, jj, kk] = r
-                        tmp1[2, jj, kk] = m1
-                        tmp1[3, jj, kk] = m2
-                        tmp1[4, jj, kk] = m3
-                    end
-
-                    # --- pass 2: contract over j ---
-                    r2 = 0.0
-                    m12 = 0.0
-                    m22 = 0.0
-                    m32 = 0.0
-                    # we fold pass 2 + pass 3 together for the k loop
-                    @inbounds for kk in 1:n
-                        r_j = 0.0
-                        m1_j = 0.0
-                        m2_j = 0.0
-                        m3_j = 0.0
-                        for jj in 1:n
-                            w = wy[jj]
-                            r_j += tmp1[1, jj, kk] * w
-                            m1_j += tmp1[2, jj, kk] * w
-                            m2_j += tmp1[3, jj, kk] * w
-                            m3_j += tmp1[4, jj, kk] * w
-                        end
-                        # --- pass 3: contract over k ---
-                        wk = wz[kk]
-                        r2 += r_j * wk
-                        m12 += m1_j * wk
-                        m22 += m2_j * wk
-                        m32 += m3_j * wk
-                    end
-
-                    # conservative -> primitive
-                    inv_rho = 1.0 / r2
-                    @inbounds vx[ix, iy, iz] = m12 * inv_rho
-                    @inbounds vy[ix, iy, iz] = m22 * inv_rho
-                    @inbounds vz[ix, iy, iz] = m32 * inv_rho
-                end
-            end
+    # pass 2: contract j  ->  B[sx, sy, k]
+    @inbounds for k in 1:nn, sy in 1:nn, sx in 1:nn
+        acc = 0.0
+        for j in 1:nn
+            acc += lag[sy, j] * A[sx, j, k]
         end
+        B[sx, sy, k] = acc
+    end
+
+    # pass 3: contract k and scatter into the uniform grid. cx, cy, cz are the
+    # 0-based cell indices, so this cell fills grid[cx*nn+1 : cx*nn+nn, ...].
+    @inbounds for sz in 1:nn, sy in 1:nn, sx in 1:nn
+        acc = 0.0
+        for k in 1:nn
+            acc += lag[sz, k] * B[sx, sy, k]
+        end
+        grid[cx * nn + sx, cy * nn + sy, cz * nn + sz] = acc
     end
 
     return nothing
 end
 
-# same idea, but reads primitive vars straight from HDF5 instead of a live u
-
-function _vel_to_grid_from_prim!(ws::PSWorkspace, prim_data,
-                                 mesh::Trixi.TreeMesh, solver, cache)
-    N_grid = ws.N_grid
-    vx, vy, vz = ws.vx, ws.vy, ws.vz
-    fill!(vx, 0.0)
-    fill!(vy, 0.0)
-    fill!(vz, 0.0)
-
-    nodes = solver.basis.nodes
-    bary_w = Trixi.barycentric_weights(nodes)
-    n = length(nodes)
-    N_cells = _cells_per_dim(mesh)
-
-    lookup, x0, dx_cell = _build_cell_lookup(mesh, cache)
-
-    half_cell = dx_cell / 2
-    lag1d = Vector{Vector{Float64}}(undef, n)
-    for s in 0:(n - 1)
-        xi = ((s + 0.5) / n * dx_cell - half_cell) / half_cell
-        lag1d[s + 1] = Trixi.lagrange_interpolating_polynomials(xi, nodes, bary_w)
-    end
-
-    nn = n  # nodes per dim
-    nn3 = nn^3
-
-    # prim_data indices: 1=rho (unused for velocity), 2=v1, 3=v2, 4=v3
-    v1_raw = prim_data[2]
-    v2_raw = prim_data[3]
-    v3_raw = prim_data[4]
-
-    total_cells = N_cells^3
-    @threads for linear_idx in 1:total_cells
-        rem1 = linear_idx - 1
-        cz_m1, rem2 = divrem(rem1, N_cells^2)
-        cy_m1, cx_m1 = divrem(rem2, N_cells)
-        cx = cx_m1 + 1
-        cy = cy_m1 + 1
-        cz = cz_m1 + 1
-
-        eid = lookup[cx, cy, cz]
-        base = (eid - 1) * nn3
-
-        # small stack buffers for the 1D contraction
-        tmp1 = MArray{Tuple{3, nn, nn}, Float64}(undef)  # [var, j, k]
-
-        for sz in 0:(nn - 1)
-            iz = (cz - 1) * nn + sz + 1
-            wz = lag1d[sz + 1]
-            for sy in 0:(nn - 1)
-                iy = (cy - 1) * nn + sy + 1
-                wy = lag1d[sy + 1]
-                for sx in 0:(nn - 1)
-                    ix = (cx - 1) * nn + sx + 1
-                    wx = lag1d[sx + 1]
-
-                    # pass 1: contract i
-                    @inbounds for kk in 1:nn, jj in 1:nn
-                        a1 = 0.0
-                        a2 = 0.0
-                        a3 = 0.0
-                        for ii in 1:nn
-                            idx = base + ii + (jj - 1) * nn + (kk - 1) * nn^2
-                            w = wx[ii]
-                            a1 += v1_raw[idx] * w
-                            a2 += v2_raw[idx] * w
-                            a3 += v3_raw[idx] * w
-                        end
-                        tmp1[1, jj, kk] = a1
-                        tmp1[2, jj, kk] = a2
-                        tmp1[3, jj, kk] = a3
-                    end
-
-                    # pass 2+3: contract j then k
-                    r1 = 0.0
-                    r2 = 0.0
-                    r3 = 0.0
-                    @inbounds for kk in 1:nn
-                        s1 = 0.0
-                        s2 = 0.0
-                        s3 = 0.0
-                        for jj in 1:nn
-                            w = wy[jj]
-                            s1 += tmp1[1, jj, kk] * w
-                            s2 += tmp1[2, jj, kk] * w
-                            s3 += tmp1[3, jj, kk] * w
-                        end
-                        wk = wz[kk]
-                        r1 += s1 * wk
-                        r2 += s2 * wk
-                        r3 += s3 * wk
-                    end
-
-                    @inbounds vx[ix, iy, iz] = r1
-                    @inbounds vy[ix, iy, iz] = r2
-                    @inbounds vz[ix, iy, iz] = r3
-                end
-            end
-        end
-    end
-
-    return nothing
-end
-
-# same, but using a PSGeometryCache instead of semi
+# Interpolate the primitive velocities from the GLL nodes onto the uniform grid
+# the FFT runs on. The three velocity components are handled independently, one _interpolate_cell! call each.
 
 function _vel_to_grid_from_prim!(ws::PSWorkspace, prim_data,
                                  cache::PSGeometryCache)
-    N_grid = ws.N_grid
     vx, vy, vz = ws.vx, ws.vy, ws.vz
     fill!(vx, 0.0)
     fill!(vy, 0.0)
     fill!(vz, 0.0)
 
-    nodes = cache.nodes
-    bary_w = cache.bary_w
-    nn = length(nodes)          # nodes per dim = polydeg + 1
-    nn3 = nn^3
+    nn = length(cache.nodes)          # nodes per dim = polydeg + 1
     N_cells = cache.N_cells
     lookup = cache.lookup
+    lag = cache.lag1d               
 
-    # lag1d[s+1, i] already stored as a matrix in the cache
-    lag1d_mat = cache.lag1d   # (nn × nn)
+    grids = (vx, vy, vz)
+    velocities = (prim_data[2], prim_data[3], prim_data[4])
 
-    v1_raw = prim_data[2]
-    v2_raw = prim_data[3]
-    v3_raw = prim_data[4]
+    # one scratch pair per thread, reused across all cells that thread handles
+    nt = Threads.maxthreadid()
+    scratch_A = [Array{Float64}(undef, nn, nn, nn) for _ in 1:nt]
+    scratch_B = [Array{Float64}(undef, nn, nn, nn) for _ in 1:nt]
 
-    total_cells = N_cells^3
-    @threads for linear_idx in 1:total_cells
-        rem1 = linear_idx - 1
-        cz_m1, rem2 = divrem(rem1, N_cells^2)
-        cy_m1, cx_m1 = divrem(rem2, N_cells)
-        cx = cx_m1 + 1
-        cy = cy_m1 + 1
-        cz = cz_m1 + 1
+    @threads for cell in 1:N_cells^3
+        cz, r = divrem(cell - 1, N_cells^2)
+        cy, cx = divrem(r, N_cells)
 
-        eid = lookup[cx, cy, cz]
-        base = (eid - 1) * nn3
+        eid = lookup[cx + 1, cy + 1, cz + 1]
+        base = (eid - 1) * nn^3
 
-        tmp1 = MArray{Tuple{3, nn, nn}, Float64}(undef)
+        A = scratch_A[threadid()]
+        B = scratch_B[threadid()]
 
-        for sz in 0:(nn - 1)
-            iz = (cz - 1) * nn + sz + 1
-            wz = @view lag1d_mat[sz + 1, :]
-            for sy in 0:(nn - 1)
-                iy = (cy - 1) * nn + sy + 1
-                wy = @view lag1d_mat[sy + 1, :]
-                for sx in 0:(nn - 1)
-                    ix = (cx - 1) * nn + sx + 1
-                    wx = @view lag1d_mat[sx + 1, :]
-
-                    # pass 1: contract i
-                    @inbounds for kk in 1:nn, jj in 1:nn
-                        a1 = 0.0
-                        a2 = 0.0
-                        a3 = 0.0
-                        for ii in 1:nn
-                            idx = base + ii + (jj - 1) * nn + (kk - 1) * nn^2
-                            w = wx[ii]
-                            a1 += v1_raw[idx] * w
-                            a2 += v2_raw[idx] * w
-                            a3 += v3_raw[idx] * w
-                        end
-                        tmp1[1, jj, kk] = a1
-                        tmp1[2, jj, kk] = a2
-                        tmp1[3, jj, kk] = a3
-                    end
-
-                    # pass 2+3: contract j then k
-                    r1 = 0.0
-                    r2 = 0.0
-                    r3 = 0.0
-                    @inbounds for kk in 1:nn
-                        s1 = 0.0
-                        s2 = 0.0
-                        s3 = 0.0
-                        for jj in 1:nn
-                            w = wy[jj]
-                            s1 += tmp1[1, jj, kk] * w
-                            s2 += tmp1[2, jj, kk] * w
-                            s3 += tmp1[3, jj, kk] * w
-                        end
-                        wk = wz[kk]
-                        r1 += s1 * wk
-                        r2 += s2 * wk
-                        r3 += s3 * wk
-                    end
-
-                    @inbounds vx[ix, iy, iz] = r1
-                    @inbounds vy[ix, iy, iz] = r2
-                    @inbounds vz[ix, iy, iz] = r3
-                end
-            end
+        for c in 1:3
+            _interpolate_cell!(grids[c], velocities[c], base, cx, cy, cz, nn, lag,
+                               A, B)
         end
     end
 
@@ -419,12 +188,18 @@ end
 # bins |k| into shells and sums power per shell, threaded over kz slices
 
 function _shell_spectrum_fast!(ws::PSWorkspace, n_bins::Int;
+                               k_cutoff::Symbol = :nyquist,
                                ignore_mixed_parity::Bool = false)
     (; fvx, fvy, fvz, N_grid, L) = ws
 
     dk = 2pi / L
     k_nyq = pi * N_grid / L
-    k_max = sqrt(3) * k_nyq
+    # shells past the Nyquist wavenumber are only partially covered by the grid and
+    # therefore under-report the power; :cube keeps them out to the corner of the
+    # k-cube, which is what an exact Parseval check needs
+    k_max = k_cutoff === :nyquist ? k_nyq :
+            k_cutoff === :cube ? sqrt(3) * k_nyq :
+            error("k_cutoff must be :nyquist or :cube")
 
     # log-spaced bins
     log_lo = log10(0.5 * dk)
@@ -437,20 +212,19 @@ function _shell_spectrum_fast!(ws::PSWorkspace, n_bins::Int;
     ky_vals = fftfreq(N_grid, N_grid)
     kz_vals = fftfreq(N_grid, N_grid)
 
-    norm = L^3 / N_grid^6
+    # per-mode power |v_hat|^2 from FFTW's unnormalised output
+    norm = 1.0 / N_grid^6
     n_kx = div(N_grid, 2) + 1
 
-    # thread-local accumulators (maxthreadid covers all threadpools in Julia 1.9+)
+    # thread-local accumulators 
     nt = Threads.maxthreadid()
     E_local = [zeros(Float64, n_bins) for _ in 1:nt]
-    n_local = [zeros(Int, n_bins) for _ in 1:nt]
-    nf_local = [zeros(Int, n_bins) for _ in 1:nt]
+    modes_local = [zeros(Int, n_bins) for _ in 1:nt]
 
     @threads for ikz in 1:N_grid
         tid = threadid()
         E_t = E_local[tid]
-        n_t = n_local[tid]
-        nf_t = nf_local[tid]
+        modes_t = modes_local[tid]
         kz = kz_vals[ikz] * dk
 
         @inbounds for iky in 1:N_grid
@@ -478,8 +252,7 @@ function _shell_spectrum_fast!(ws::PSWorkspace, n_bins::Int;
                 b = floor(Int, (log10(k_mag) - log_lo) * inv_dk_log) + 1
                 if 1 <= b <= n_bins
                     E_t[b] += P
-                    n_t[b] += 1
-                    nf_t[b] += mult
+                    modes_t[b] += mult
                 end
             end
         end
@@ -487,67 +260,39 @@ function _shell_spectrum_fast!(ws::PSWorkspace, n_bins::Int;
 
     # reduce across threads
     E_bins = sum(E_local)
-    n_modes = sum(n_local)
-    n_full = sum(nf_local)
+    n_modes = sum(modes_local)
 
-    # convert to spectral density
+    # convert to the spectral density E(k) = 4 pi k^2 <E_v(k)>
     k_centers = zeros(Float64, n_bins)
     Ek = zeros(Float64, n_bins)
     for i in 1:n_bins
         k_centers[i] = sqrt(bin_edges[i] * bin_edges[i + 1])
-        if n_full[i] > 0
-            Ek[i] = E_bins[i] / (bin_edges[i + 1] - bin_edges[i])
-        end
+        Ek[i] = _spectral_density(k_centers[i], E_bins[i], n_modes[i], L)
     end
 
+    # n_modes counts the modes the sums actually contain, i.e. both halves of every
+    # conjugate pair 
     return k_centers, Ek, n_modes, bin_edges
 end
 
-# grid + FFT + bin, straight from a live u_ode
-function measure_power_spectrum(ws::PSWorkspace, semi, u_ode; n_bins::Int = 2000,
-                                ignore_mixed_parity::Bool = false)
-    mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
-    u = Trixi.wrap_array(u_ode, semi)
-
-    _vel_to_grid_fast!(ws, u, mesh, equations, solver, cache)
-
-    # in-place FFT using the pre-planned transform
-    mul!(ws.fvx, ws.plan, ws.vx)
-    mul!(ws.fvy, ws.plan, ws.vy)
-    mul!(ws.fvz, ws.plan, ws.vz)
-
-    return _shell_spectrum_fast!(ws, n_bins; ignore_mixed_parity = ignore_mixed_parity)
-end
-
-# same, from primitive vars loaded from disk
-function measure_power_spectrum_prim(ws::PSWorkspace, prim_data, semi;
-                                     n_bins::Int = 2000, ignore_mixed_parity::Bool = false)
-    mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
-
-    _vel_to_grid_from_prim!(ws, prim_data, mesh, solver, cache)
-
-    mul!(ws.fvx, ws.plan, ws.vx)
-    mul!(ws.fvy, ws.plan, ws.vy)
-    mul!(ws.fvz, ws.plan, ws.vz)
-
-    return _shell_spectrum_fast!(ws, n_bins; ignore_mixed_parity = ignore_mixed_parity)
-end
-
-# same, but with a PSGeometryCache instead of semi (skips trixi_include)
+# grid + FFT + bin
 function measure_power_spectrum_prim(ws::PSWorkspace, prim_data, cache::PSGeometryCache;
-                                     n_bins::Int = 2000, ignore_mixed_parity::Bool = false)
-    _vel_to_grid_from_prim!(ws, prim_data, cache)
+                                     n_bins::Int = 2000, k_cutoff::Symbol = :nyquist,
+                                     ignore_mixed_parity::Bool = false)
+   
+   _vel_to_grid_from_prim!(ws, prim_data, cache)
 
     mul!(ws.fvx, ws.plan, ws.vx)
     mul!(ws.fvy, ws.plan, ws.vy)
     mul!(ws.fvz, ws.plan, ws.vz)
 
-    return _shell_spectrum_fast!(ws, n_bins; ignore_mixed_parity = ignore_mixed_parity)
+    return _shell_spectrum_fast!(ws, n_bins; k_cutoff = k_cutoff,
+                                 ignore_mixed_parity = ignore_mixed_parity)
 end
 
 # merges neighboring bins that have too few modes so the spectrum isn't noisy at low k
 
-function rebin_spectrum(k_centers, Ek, n_modes, bin_edges;
+function rebin_spectrum(k_centers, Ek, n_modes, bin_edges; L::Float64,
                         min_modes_low_k::Int = 1,
                         min_modes_high_k::Int = 10,
                         k_split::Union{Nothing, Float64} = nothing)
@@ -565,29 +310,34 @@ function rebin_spectrum(k_centers, Ek, n_modes, bin_edges;
 
     i = 1
     while i <= n
-        n_modes[i] == 0 && (i += 1; continue)
+        if n_modes[i] == 0
+            i += 1
+            continue
+        end
 
         min_m = k_centers[i] < k_split ? min_modes_low_k : min_modes_high_k
 
-        sum_Edk = 0.0
-        dk_tot = 0.0
+        # merge the summed shell power and the mode counts, not the E values, so the
+        # merged bin obeys the same E(k) = 4 pi k^2 <E_v> definition exactly
+        power_tot = 0.0
+        k_weighted = 0.0
         m_tot = 0
-        i0 = i
         j = i
 
         while j <= n && m_tot < min_m
             if n_modes[j] > 0
-                dkj = bin_edges[j + 1] - bin_edges[j]
-                sum_Edk += Ek[j] * dkj
-                dk_tot += dkj
+                power_tot += Ek[j] * n_modes[j] / _modes_per_dk(k_centers[j], L)
+                k_weighted += n_modes[j] * k_centers[j]
                 m_tot += n_modes[j]
             end
             j += 1
         end
 
-        if m_tot > 0 && dk_tot > 0
-            push!(k_out, sqrt(bin_edges[i0] * bin_edges[j]))
-            push!(E_out, sum_Edk / dk_tot)
+        if m_tot > 0
+            # represent the merged bin by the mean |k| of the modes it holds.
+            k_new = k_weighted / m_tot
+            push!(k_out, k_new)
+            push!(E_out, _spectral_density(k_new, power_tot, m_tot, L))
             push!(cnt, m_tot)
         end
 

@@ -1,5 +1,5 @@
 using OrdinaryDiffEqLowStorageRK: DiscreteCallback
-
+#
 include(joinpath(@__DIR__, "..", "TurbGen.jl"))
 using .TurbGen
 
@@ -33,7 +33,7 @@ initial_condition = initial_condition_uniform
 turb_velocity = 0.3       # target Mach number (M ~ 0.3)
 turb_sol_weight = 1.0     # solenoidal weight (1.0 = purely solenoidal)
 cell = 5
-name_addition = "_isothermal_M0.3"
+name_addition = "_local_isothermal_M0.3"
 num_cells = 2^cell
 polydeg = 3
 domain_length = 1.0
@@ -189,6 +189,7 @@ function _injected_power(src, u, eqs_hyp, solver, cache)
     total_power = zero(real(eltype(u)))
     total_volume = zero(real(eltype(u)))
     for element in Trixi.eachelement(solver, cache)
+        # TreeMesh: constant Jacobian per element
         abs_J = abs(inv(inv_jacobian[element]))
         for k in Trixi.eachnode(solver), j in Trixi.eachnode(solver),
             i in Trixi.eachnode(solver)
@@ -215,7 +216,7 @@ function Trixi.analyze(ip::InjectedPowerIntegral, du, u, t,
                        semi::Trixi.AbstractSemidiscretization)
     mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
 
-    # equations is a tuple (hyp, par)
+    # equations is a tuple (hyp, par) for the hyperbolic-parabolic case
     eqs_hyp = equations isa Tuple ? equations[1] : equations
 
     return Trixi.@trixi_timeit Trixi.timer() "turbgen injected power" begin
@@ -310,7 +311,7 @@ function integration_measure(semi)
     return V
 end
 ###############################################################################
-# solver with subcell IDP shock capturing
+# solver with subcell IDP shock capturing (local + positivity limiting)
 
 surface_flux = flux_lax_friedrichs
 volume_flux = flux_ranocha
@@ -318,7 +319,10 @@ volume_flux = flux_ranocha
 basis = LobattoLegendreBasis(polydeg)
 limiter_idp = SubcellLimiterIDP(equations, basis;
                                 positivity_variables_cons = ["rho"],
-                                positivity_variables_nonlinear = [pressure])
+                                positivity_variables_nonlinear = [pressure],
+                                local_twosided_variables_cons = ["rho"],
+                                local_onesided_variables_nonlinear = [(entropy, max)],
+                                max_iterations_newton = 100)
 volume_integral = VolumeIntegralSubcellLimiting(limiter_idp;
                                                 volume_flux_dg = volume_flux,
                                                 volume_flux_fv = surface_flux)
@@ -343,7 +347,7 @@ semi = SemidiscretizationHyperbolicParabolic(mesh, (equations, equations_parabol
 ###############################################################################
 # ODE solvers, callbacks etc.
 
-# ~3 turnover times to spin up + 5 to collect statistics
+# 8 turnover times total, ~3 to spin up + 5 to collect statistics
 n_turnovers = 8.0
 tspan = (0.0, n_turnovers * t_turnover)
 ode = semidiscretize(semi, tspan)

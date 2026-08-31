@@ -3,7 +3,7 @@ using HDF5
 # save/load for PSGeometryCache, so we don't have to trixi_include just to get
 # node coords and interpolation lookups every time we run an analysis script
 
-const GEOCACHE_K_DRIV = 1.5   # driving wavenumber, same in all elixirs
+const GEOCACHE_K_DRIV = 2.0
 
 function _geocache_filename(N_cells::Int, polydeg::Int, L::Float64)
     return "geocache_cells$(N_cells)_pd$(polydeg)_L$(L).h5"
@@ -86,6 +86,8 @@ function get_or_build_geometry(N_cells::Int, polydeg::Int, L::Float64;
 
     println("  [geocache] cache miss, running trixi_include to build geometry...")
     elixir_fn()
+    # trixi_include defines `semi` in Main in a newer world age than this function
+    # was compiled in, so we reach it through invokelatest to avoid a world-age error.
     semi_global = Base.invokelatest(() -> Main.semi)
     geo = Base.invokelatest(build_geometry_from_semi, semi_global)
     save_geometry_cache(fpath, geo)

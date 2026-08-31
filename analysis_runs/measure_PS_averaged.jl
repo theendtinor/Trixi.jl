@@ -10,11 +10,9 @@ desktop_run_dir = joinpath(homedir(), "Desktop", "Runs")
 
 output_dirs = [
     joinpath(homedir(), "Desktop", "Runs",
-             "out_euler_subcell_v3.2_sol1.0_cells32_L1.0_pd3_verit_dm0"),
-    joinpath(homedir(), "Desktop", "Runs",
-             "out_euler_subcell_v3.2_sol1.0_cells32_L1.0_pd3_verit_sf0_sup")
+             "out_ns_subcell_v0.5_sol1.0_cells32_L1.0_pd3_mu5.0e-7_pr0.72_verns_subcell_lim_coeff")
 ]
-N_avg = 8
+N_avg = 16
 
 const GEOCACHE_DIR = joinpath(@__DIR__, "geocache")
 
@@ -79,7 +77,7 @@ function process_run(output_dir::String; N_avg::Int = 12)
     L = something(p.L, 1.0)
     polydeg = something(p.polydeg, 3)
 
-    # t_turnover: reproduced from TurbGen.jl init_driving! (k_driv = 1.5, always)
+    # t_turnover: reproduced from TurbGen.jl init_driving! (k_driv = GEOCACHE_K_DRIV)
     t_turnover = compute_t_turnover(L, p.v_turb)
     println("  t_turnover = $t_turnover  (L=$L, v_turb=$(p.v_turb), k_driv=$(GEOCACHE_K_DRIV))")
 
@@ -95,14 +93,24 @@ function process_run(output_dir::String; N_avg::Int = 12)
                                                                :name_addition => p.name_add,
                                                                :polydeg => polydeg)
                                     p.mu !== nothing && (kwargs[:mu] = p.mu)
+                                    # variable name for the box size differs between
+                                    # elixirs: navierstokes_{subcell,shockcapturing} use
+                                    # domain_length, everything else uses domain_size
+                                    if p.L !== nothing
+                                        domain_key = p.elixir in
+                                                     ("elixir_navierstokes_turbgen_subcell.jl",
+                                                      "elixir_navierstokes_turbgen_shockcapturing.jl") ?
+                                                     :domain_length : :domain_size
+                                        kwargs[domain_key] = p.L
+                                    end
                                     trixi_include(elixir_path; kwargs...)
                                 end)
 
-    _process_run_inner(output_dir, N_avg, geo, t_turnover)
+    _process_run_inner(output_dir, N_avg, geo, t_turnover, p)
 end
 
 function _process_run_inner(output_dir::String, N_avg::Int,
-                            geo::PSGeometryCache, t_turnover::Float64)
+                            geo::PSGeometryCache, t_turnover::Float64, p)
     t_start = 3.0 * t_turnover
 
     all_files = sort(filter(f -> startswith(basename(f), "solution_") &&
@@ -146,18 +154,13 @@ function _process_run_inner(output_dir::String, N_avg::Int,
     cnt_rb = nothing
 
     for (i, (fpath, t)) in enumerate(selected)
-        t_start_snap = time()
         println("[$i/$N_avg] $(basename(fpath))  t=$(round(t, digits=4))")
 
-        t_io = @elapsed prim_data = load_prim_data(fpath)
-        t_ps = @elapsed begin
-            k_r, Ek_r, c_r, edges = measure_power_spectrum_prim(ws, prim_data, geo)
-        end
-        t_rb = @elapsed begin
-            k_b, Ek_b, c_b = rebin_spectrum(k_r, Ek_r, c_r, edges;
-                                            min_modes_low_k = 100,
-                                            min_modes_high_k = 2000)
-        end
+        prim_data = load_prim_data(fpath)
+        k_r, Ek_r, c_r, edges = measure_power_spectrum_prim(ws, prim_data, geo)
+        k_b, Ek_b, c_b = rebin_spectrum(k_r, Ek_r, c_r, edges; L = ws.L,
+                                        min_modes_low_k = 20,
+                                        min_modes_high_k = 2000)
 
         if i == 1
             k_ref_raw, k_ref_rb = k_r, k_b
@@ -165,14 +168,9 @@ function _process_run_inner(output_dir::String, N_avg::Int,
             cnt_raw, cnt_rb = c_r, c_b
         else
             Ek_sum_raw .+= Ek_r
+            # rebinned bins have the same length for all snapshots (same N_grid, L)
             Ek_sum_rb .+= Ek_b
         end
-
-        t_total = time() - t_start_snap
-        println("  IO: $(round(t_io, digits=2))s  " *
-                "interp+FFT+bin: $(round(t_ps, digits=2))s  " *
-                "rebin: $(round(t_rb, digits=4))s  " *
-                "total: $(round(t_total, digits=2))s")
     end
 
     Ek_avg_raw = Ek_sum_raw ./ N_avg
@@ -188,7 +186,7 @@ function _process_run_inner(output_dir::String, N_avg::Int,
         println("  bin $i  k=$(round(k, digits=2))  modes=$cnt  E=$(round(Ek, sigdigits=4))")
     end
 
-    # fit reference lines against a bin near the driving scale
+    # reference slopes, anchored to the measured spectrum at k ~ 110
     k_fit = k_ref_rb[ok_rb]
     Ek_fit = Ek_avg_rb[ok_rb]
     a_idx = argmin(abs.(k_fit .- 110.0))
@@ -200,11 +198,16 @@ function _process_run_inner(output_dir::String, N_avg::Int,
     kd_lo = 1.0 * 2pi
     kd_hi = 2.0 * 2pi
 
+    # tick every 100 in k, covering the plotted range
+    k_tick_max = maximum(k_ref_rb[ok_rb])
+    k_ticks = collect(100:100:k_tick_max)
+    xticks = (k_ticks, string.(k_ticks))
+
     plt = plot(k_ref_rb[ok_rb], Ek_avg_rb[ok_rb];
                xscale = :log10, yscale = :log10,
                label = "rebinned (avg, N=$N_avg)",
                marker = :diamond, ms = 1.5, lw = 1.5, color = :crimson,
-               xlabel = "k", ylabel = "E(k)",
+               xlabel = "k", ylabel = "E(k)", xticks = xticks,
                title = "Averaged Velocity Power Spectrum",
                legend = :bottomleft, size = (800, 600), dpi = 200)
 
@@ -226,18 +229,17 @@ function _process_run_inner(output_dir::String, N_avg::Int,
     println("Saving data to $h5_out")
 
     h5open(h5_out, "w") do f
-        p_res = parse_outdir(output_dir)
         # Metadata
-        attributes(f)["v_turb"] = p_res.v_turb
-        attributes(f)["sw"] = p_res.sw
-        attributes(f)["cells"] = p_res.nc
-        attributes(f)["ref"] = p_res.ref
-        attributes(f)["name_addition"] = p_res.name_add
-        attributes(f)["elixir"] = p_res.elixir
-        attributes(f)["polydeg"] = p_res.polydeg === nothing ? -1 : p_res.polydeg
-        attributes(f)["mu"] = p_res.mu === nothing ? 0.0 : p_res.mu
-        attributes(f)["pr"] = p_res.pr === nothing ? 0.0 : p_res.pr
-        attributes(f)["L"] = p_res.L === nothing ? 1.0 : p_res.L
+        attributes(f)["v_turb"] = p.v_turb
+        attributes(f)["sw"] = p.sw
+        attributes(f)["cells"] = p.nc
+        attributes(f)["ref"] = p.ref
+        attributes(f)["name_addition"] = p.name_add
+        attributes(f)["elixir"] = p.elixir
+        attributes(f)["polydeg"] = p.polydeg === nothing ? -1 : p.polydeg
+        attributes(f)["mu"] = p.mu === nothing ? 0.0 : p.mu
+        attributes(f)["pr"] = p.pr === nothing ? 0.0 : p.pr
+        attributes(f)["L"] = p.L === nothing ? 1.0 : p.L
         attributes(f)["N_avg"] = N_avg
 
         # Raw Data
@@ -254,17 +256,6 @@ function _process_run_inner(output_dir::String, N_avg::Int,
     end
 end
 
-# Entry point
-if length(ARGS) > 0
-    for arg in ARGS
-        process_run(arg; N_avg = N_avg)
-    end
-else
-    println("No arguments provided, processing $(length(output_dirs)) default target(s):")
-    for (i, target) in enumerate(output_dirs)
-        println("  [$i] $target")
-    end
-    for target in output_dirs
-        process_run(target; N_avg = N_avg)
-    end
+for target in output_dirs
+    process_run(target; N_avg = N_avg)
 end
